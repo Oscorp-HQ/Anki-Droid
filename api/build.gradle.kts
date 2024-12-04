@@ -46,14 +46,14 @@ android {
         }
     }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions {
         // enable explicit api mode for additional checks related to the public api
         // see https://kotlinlang.org/docs/whatsnew14.html#explicit-api-mode-for-library-authors
         freeCompilerArgs += "-Xexplicit-api=strict"
-        jvmTarget = JavaVersion.VERSION_11.toString()
+        jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
     publishing {

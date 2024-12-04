@@ -6,8 +6,8 @@ plugins {
 }
 
 tasks.withType(JavaCompile::class).configureEach {
-    sourceCompatibility = JavaVersion.VERSION_11.toString()
-    targetCompatibility = JavaVersion.VERSION_11.toString()
+    sourceCompatibility = JavaVersion.VERSION_17.toString()
+    targetCompatibility = JavaVersion.VERSION_17.toString()
 }
 
 tasks.withType(KotlinCompile::class).all {
