@@ -1,0 +1,392 @@
+//noinspection MissingCopyrightHeader #8659
+
+package com.ichi2.anki
+
+import android.content.Intent
+import android.os.Build
+import android.os.Parcelable
+import android.webkit.RenderProcessGoneDetail
+import androidx.annotation.CheckResult
+import androidx.core.os.BundleCompat
+import androidx.core.os.bundleOf
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.filters.SdkSuppress
+import anki.config.ConfigKey
+import com.ichi2.anim.ActivityTransitionAnimation
+import com.ichi2.anki.AbstractFlashcardViewer.Companion.toAnimationTransition
+import com.ichi2.anki.AbstractFlashcardViewer.WebViewSignalParserUtils.ANSWER_ORDINAL_1
+import com.ichi2.anki.AbstractFlashcardViewer.WebViewSignalParserUtils.ANSWER_ORDINAL_2
+import com.ichi2.anki.AbstractFlashcardViewer.WebViewSignalParserUtils.ANSWER_ORDINAL_3
+import com.ichi2.anki.AbstractFlashcardViewer.WebViewSignalParserUtils.ANSWER_ORDINAL_4
+import com.ichi2.anki.AbstractFlashcardViewer.WebViewSignalParserUtils.RELINQUISH_FOCUS
+import com.ichi2.anki.AbstractFlashcardViewer.WebViewSignalParserUtils.SHOW_ANSWER
+import com.ichi2.anki.AbstractFlashcardViewer.WebViewSignalParserUtils.SIGNAL_NOOP
+import com.ichi2.anki.AbstractFlashcardViewer.WebViewSignalParserUtils.TYPE_FOCUS
+import com.ichi2.anki.AbstractFlashcardViewer.WebViewSignalParserUtils.getSignalFromUrl
+import com.ichi2.anki.AnkiActivity.Companion.FINISH_ANIMATION_EXTRA
+import com.ichi2.anki.cardviewer.Gesture
+import com.ichi2.anki.cardviewer.ViewerCommand
+import com.ichi2.anki.preferences.sharedPrefs
+import com.ichi2.anki.reviewer.AutomaticAnswer
+import com.ichi2.anki.reviewer.AutomaticAnswerAction
+import com.ichi2.anki.reviewer.AutomaticAnswerSettings
+import com.ichi2.anki.servicelayer.LanguageHintService
+import com.ichi2.libanki.undoableOp
+import com.ichi2.testutils.AnkiAssert.assertDoesNotThrow
+import com.ichi2.testutils.common.Flaky
+import com.ichi2.testutils.common.OS
+import com.ichi2.utils.createBasicTypingModel
+import org.hamcrest.MatcherAssert.assertThat
+import org.hamcrest.Matchers.containsString
+import org.hamcrest.Matchers.equalTo
+import org.hamcrest.Matchers.not
+import org.hamcrest.Matchers.notNullValue
+import org.hamcrest.Matchers.nullValue
+import org.junit.Assert.assertEquals
+import org.junit.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.Arguments
+import org.junit.jupiter.params.provider.MethodSource
+import org.junit.runner.RunWith
+import org.mockito.Mockito.mock
+import org.robolectric.Robolectric
+import org.robolectric.android.controller.ActivityController
+import timber.log.Timber
+import java.util.Locale
+import java.util.stream.Stream
+import com.ichi2.anim.ActivityTransitionAnimation.Direction as Direction
+
+@Suppress("SameParameterValue")
+@SdkSuppress(minSdkVersion = Build.VERSION_CODES.O) // getImeHintLocales, toLanguageTags, onRenderProcessGone, RenderProcessGoneDetail
+@RunWith(AndroidJUnit4::class)
+class AbstractFlashcardViewerTest : RobolectricTest() {
+    class NonAbstractFlashcardViewer : AbstractFlashcardViewer() {
+        var answered: Ease? = null
+        private var lastTime = 0
+        override fun performReload() {
+            // intentionally blank
+        }
+
+        val typedInput get() = typedInputText
+
+        override fun answerCard(ease: Ease) {
+            super.answerCard(ease)
+            answered = ease
+        }
+
+        override val elapsedRealTime: Long
+            get() {
+                lastTime += baseContext.sharedPrefs()
+                    .getInt(DOUBLE_TAP_TIME_INTERVAL, DEFAULT_DOUBLE_TAP_TIME_INTERVAL)
+                return lastTime.toLong()
+            }
+        val hintLocale: String?
+            get() {
+                val imeHintLocales = answerField!!.imeHintLocales ?: return null
+                return imeHintLocales.toLanguageTags()
+            }
+
+        fun hasAutomaticAnswerQueued(): Boolean {
+            return automaticAnswer.timeoutHandler.hasMessages(0)
+        }
+
+        /**
+         * Fixes an issue with noAutomaticAnswerAfterRenderProcessGoneAndPaused_issue9632
+         * where [onSoundGroupCompleted] executed AFTER [executeCommand] completed
+         * this lead to an assertion which sometimes occurred before [onSoundGroupCompleted] had
+         * been called, which failed
+         *
+         * This is fine in real life, as we have sounds to play
+         */
+        private var soundGroupCompleted = false
+
+        override fun onSoundGroupCompleted() {
+            super.onSoundGroupCompleted()
+            soundGroupCompleted = true
+        }
+
+        override fun executeCommand(which: ViewerCommand, fromGesture: Gesture?): Boolean {
+            soundGroupCompleted = false
+            return super.executeCommand(which, fromGesture).also {
+                if (which != ViewerCommand.SHOW_ANSWER) return@also
+                Timber.v("waiting for onSoundGroupCompleted")
+                for (i in 0..100) {
+                    if (soundGroupCompleted) break
+                    Thread.sleep(10)
+                }
+                require(soundGroupCompleted) { "soundGroupCompleted never occurred" }
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("getSignalFromUrlTest_args")
+    fun getSignalFromUrlTest(url: String, signal: Int) {
+        assertEquals(getSignalFromUrl(url), signal)
+    }
+
+    @Test
+    fun invalidEncodingDoesNotCrash() {
+        // #5944 - input came in as: 'typeblurtext:%'. We've fixed the encoding, but want to make sure there's no crash
+        // as JS can call this function with arbitrary data.
+        val url = "typeblurtext:%"
+        val viewer: NonAbstractFlashcardViewer = getViewer(true)
+        assertDoesNotThrow { viewer.handleUrlFromJavascript(url) }
+    }
+
+    @Test
+    fun validEncodingSetsAnswerCorrectly() {
+        // 你好%
+        val url = "typechangetext:%E4%BD%A0%E5%A5%BD%25"
+        val viewer: NonAbstractFlashcardViewer = getViewer(true)
+
+        viewer.handleUrlFromJavascript(url)
+
+        assertThat(viewer.typedInput, equalTo("你好%"))
+    }
+
+    @Test
+    fun testEditingCardChangesTypedAnswer() = runTest {
+        // 7363
+        addNoteUsingBasicTypedModel("Hello", "World")
+
+        val viewer: NonAbstractFlashcardViewer = getViewer(true)
+
+        assertThat(viewer.correctTypedAnswer, equalTo("World"))
+
+        waitForAsyncTasksToComplete()
+
+        val note = viewer.currentCard!!.note()
+        note.setField(1, "David")
+        undoableOp { updateNote(note) }
+
+        waitForAsyncTasksToComplete()
+
+        assertThat(viewer.correctTypedAnswer, equalTo("David"))
+    }
+
+    @Test
+    fun testEditingCardChangesTypedAnswerOnDisplayAnswer() = runTest {
+        // 7363
+        addNoteUsingBasicTypedModel("Hello", "World")
+
+        val viewer: NonAbstractFlashcardViewer = getViewer(true)
+
+        assertThat(viewer.correctTypedAnswer, equalTo("World"))
+
+        viewer.displayCardAnswer()
+
+        assertThat(viewer.cardContent, containsString("World"))
+
+        waitForAsyncTasksToComplete()
+
+        val note = viewer.currentCard!!.note()
+        note.setField(1, "David")
+        undoableOp { updateNote(note) }
+
+        waitForAsyncTasksToComplete()
+
+        assertThat(viewer.correctTypedAnswer, equalTo("David"))
+        assertThat(viewer.cardContent, not(containsString("World")))
+        // the saving will have caused the screen to switch back to question side
+        assertThat(viewer.cardContent, containsString("Hello"))
+    }
+
+    @Test
+    fun testEditCardProvidesInverseTransition() {
+        val viewer: NonAbstractFlashcardViewer = getViewer(true)
+        val gestures = listOf(Gesture.SWIPE_LEFT, Gesture.SWIPE_UP, Gesture.LONG_TAP)
+
+        gestures.forEach { gesture ->
+            val expectedAnimation =
+                AbstractFlashcardViewer.getAnimationTransitionFromGesture(gesture)
+            val expectedInverseAnimation =
+                ActivityTransitionAnimation.getInverseTransition(expectedAnimation)
+
+            val animation = gesture.toAnimationTransition().invert()
+            val bundle = bundleOf(
+                NoteEditor.EXTRA_CALLER to NoteEditor.CALLER_EDIT,
+                NoteEditor.EXTRA_CARD_ID to viewer.currentCard!!.id,
+                FINISH_ANIMATION_EXTRA to animation as Parcelable
+            )
+            val noteEditor = NoteEditorTest().openNoteEditorWithArgs(bundle)
+            val actualInverseAnimation = BundleCompat.getParcelable(
+                noteEditor.requireArguments(),
+                FINISH_ANIMATION_EXTRA,
+                Direction::class.java
+            )
+            assertEquals(expectedInverseAnimation, actualInverseAnimation)
+        }
+    }
+
+    @Test
+    fun testCommandPerformsAnswerCard() {
+        // Regression for #8527/#8572
+        // Note: Couldn't get a spy working, so overriding the method
+
+        val viewer: NonAbstractFlashcardViewer = getViewer(true)
+
+        assertThat("Displaying question", viewer.isDisplayingAnswer, equalTo(false))
+        viewer.executeCommand(ViewerCommand.FLIP_OR_ANSWER_EASE4)
+
+        assertThat("Displaying answer", viewer.isDisplayingAnswer, equalTo(true))
+
+        viewer.executeCommand(ViewerCommand.FLIP_OR_ANSWER_EASE4)
+
+        assertThat(viewer.answered, notNullValue())
+    }
+
+    @Test
+    fun defaultLanguageIsNull() {
+        assertThat(viewer.hintLocale, nullValue())
+    }
+
+    @Test
+    @Flaky(OS.ALL, "executeCommand(FLIP_OR_ANSWER_EASE4) cannot be awaited")
+    fun typedLanguageIsSet() = runTest {
+        val withLanguage = col.createBasicTypingModel("a")
+        val normal = col.createBasicTypingModel("b")
+        val typedField = 1 // BACK
+
+        LanguageHintService.setLanguageHintForField(col.notetypes, withLanguage, typedField, Locale("ja"))
+
+        addNoteUsingModelName(withLanguage.getString("name"), "ichi", "ni")
+        addNoteUsingModelName(normal.getString("name"), "one", "two")
+        val viewer = getViewer(false)
+
+        assertThat("A model with a language hint (japanese) should use it", viewer.hintLocale, equalTo("ja"))
+
+        viewer.executeCommand(ViewerCommand.FLIP_OR_ANSWER_EASE4)
+        viewer.executeCommand(ViewerCommand.FLIP_OR_ANSWER_EASE4)
+
+        assertThat("A default model should have no preference", viewer.hintLocale, nullValue())
+    }
+
+    @Test
+    fun automaticAnswerDisabledProperty() {
+        val controller = getViewerController(addCard = true, startedWithShortcut = false)
+        val viewer = controller.get()
+        assertThat("not disabled initially", viewer.automaticAnswer.isDisabled, equalTo(false))
+        controller.pause()
+        assertThat("disabled after pause", viewer.automaticAnswer.isDisabled, equalTo(true))
+        controller.resume()
+        assertThat("enabled after resume", viewer.automaticAnswer.isDisabled, equalTo(false))
+    }
+
+    @Test
+    fun noAutomaticAnswerAfterRenderProcessGoneAndPaused_issue9632() = runTest {
+        val controller = getViewerController(addCard = true, startedWithShortcut = false)
+        val viewer = controller.get()
+        viewer.automaticAnswer = AutomaticAnswer(viewer, AutomaticAnswerSettings(AutomaticAnswerAction.BURY_CARD, true, 5.0, 5.0))
+        viewer.executeCommand(ViewerCommand.SHOW_ANSWER)
+        assertThat("messages after flipping card", viewer.hasAutomaticAnswerQueued(), equalTo(true))
+        controller.pause()
+        assertThat("disabled after pause", viewer.automaticAnswer.isDisabled, equalTo(true))
+        assertThat("no auto answer after pause", viewer.hasAutomaticAnswerQueued(), equalTo(false))
+        viewer.onRenderProcessGoneDelegate.onRenderProcessGone(viewer.webView!!, mock(RenderProcessGoneDetail::class.java))
+        assertThat("no auto answer after onRenderProcessGone when paused", viewer.hasAutomaticAnswerQueued(), equalTo(false))
+    }
+
+    @Test
+    fun `Show audio play buttons preference handling - sound`() = runTest {
+        addNoteUsingBasicTypedModel("SOUND [sound:android_audiorec.3gp]", "back")
+        getViewerContent().let { content ->
+            assertThat("show audio preference default value: enabled", content, containsString("playsound:q:0"))
+            assertThat("show audio preference default value: enabled", content, containsString("SOUND"))
+        }
+        setHidePlayAudioButtons(true)
+        getViewerContent().let { content ->
+            assertThat("show audio preference disabled", content, not(containsString("playsound:q:0")))
+            assertThat("show audio preference disabled", content, containsString("SOUND"))
+        }
+        setHidePlayAudioButtons(false)
+        getViewerContent().let { content ->
+            assertThat("show audio preference enabled explicitly", content, containsString("playsound:q:0"))
+            assertThat("show audio preference enabled explicitly", content, containsString("SOUND"))
+        }
+    }
+
+    @Test
+    fun `Show audio play buttons preference handling - tts`() = runTest {
+        addNoteUsingTextToSpeechNoteType("TTS", "BACK")
+        getViewerContent().let { content ->
+            assertThat("show audio preference default value: enabled", content, containsString("playsound:q:0"))
+            assertThat("show audio preference default value: enabled", content, containsString("TTS"))
+        }
+        setHidePlayAudioButtons(true)
+        getViewerContent().let { content ->
+            assertThat("show audio preference disabled", content, not(containsString("playsound:q:0")))
+            assertThat("show audio preference disabled", content, containsString("TTS"))
+        }
+        setHidePlayAudioButtons(false)
+        getViewerContent().let { content ->
+            assertThat("show audio preference enabled explicitly", content, containsString("playsound:q:0"))
+            assertThat("show audio preference enabled explicitly", content, containsString("TTS"))
+        }
+    }
+
+    private fun setHidePlayAudioButtons(value: Boolean) = col.config.setBool(ConfigKey.Bool.HIDE_AUDIO_PLAY_BUTTONS, value)
+
+    private fun getViewerContent(): String? {
+        // PERF: Optimise this to not create a new viewer each time
+        return getViewer(addCard = false).cardContent
+    }
+
+    @get:CheckResult
+    private val viewer: NonAbstractFlashcardViewer
+        get() = getViewer(true)
+
+    @CheckResult
+    private fun getViewer(addCard: Boolean): NonAbstractFlashcardViewer {
+        return getViewer(addCard, false)
+    }
+
+    @CheckResult
+    private fun getViewer(addCard: Boolean, startedWithShortcut: Boolean): NonAbstractFlashcardViewer {
+        return getViewerController(addCard, startedWithShortcut).get()
+    }
+
+    @CheckResult
+    private fun getViewerController(addCard: Boolean, startedWithShortcut: Boolean): ActivityController<NonAbstractFlashcardViewer> {
+        if (addCard) {
+            val n = col.newNote()
+            n.setField(0, "a")
+            col.addNote(n)
+        }
+        val intent = Intent()
+        if (startedWithShortcut) {
+            intent.putExtra(NavigationDrawerActivity.EXTRA_STARTED_WITH_SHORTCUT, true)
+        }
+        val multimediaController = Robolectric.buildActivity(NonAbstractFlashcardViewer::class.java, intent)
+            .create().start().resume().visible()
+        saveControllerForCleanup(multimediaController)
+        val viewer = multimediaController.get()
+        viewer.onCollectionLoaded(col)
+        viewer.loadInitialCard()
+        // Without this, AbstractFlashcardViewer.mCard is still null, and RobolectricTest.tearDown executes before
+        // AsyncTasks spawned by by loading the viewer finish. Is there a way to synchronize these things while under test?
+        advanceRobolectricLooperWithSleep()
+        advanceRobolectricLooperWithSleep()
+        return multimediaController
+    }
+    companion object {
+        @JvmStatic // required for @MethodSource
+        fun getSignalFromUrlTest_args(): Stream<Arguments> {
+            return Stream.of(
+                Arguments.of("signal:show_answer", SHOW_ANSWER),
+                Arguments.of("signal:typefocus", TYPE_FOCUS),
+                Arguments.of("signal:relinquishFocus", RELINQUISH_FOCUS),
+                Arguments.of("signal:answer_ease1", ANSWER_ORDINAL_1),
+                Arguments.of("signal:answer_ease2", ANSWER_ORDINAL_2),
+                Arguments.of("signal:answer_ease3", ANSWER_ORDINAL_3),
+                Arguments.of("signal:answer_ease4", ANSWER_ORDINAL_4),
+                Arguments.of("signal:answer_ease0", SIGNAL_NOOP)
+            )
+        }
+    }
+}
+
+fun AbstractFlashcardViewer.loadInitialCard() = launchCatchingTask { updateCardAndRedraw() }
+
+val AbstractFlashcardViewer.typedInputText get() = typeAnswer!!.input
+val AbstractFlashcardViewer.correctTypedAnswer get() = typeAnswer!!.correct
