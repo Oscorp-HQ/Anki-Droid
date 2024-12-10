@@ -54,12 +54,6 @@ Install
 
 </div>
 
-Signing certificate fingerprint to [verify](https://developer.android.com/studio/command-line/apksigner#usage-verify) the APK:
-```
-SHA-256: 2071534f0f4b5e54ae952dd275d70da6e3459ee69909d2ab1b4843c4c5b21a45 
-SHA-1: f24e06a3657b190a12671100402df32d7b9b3d36 
-```
-
 Wiki
 ----
 View [Wiki](https://github.com/ankidroid/Anki-Android/wiki)
@@ -93,11 +87,6 @@ Thanks to these awesome code contributors who keep this project going
 
 <a href="https://github.com/ankidroid/Anki-Android/graphs/contributors"><img src="https://opencollective.com/ankidroid/contributors.svg?width=890&button=false" /></a>
 
-### [Sponsors](https://opencollective.com/ankidroid#sponsor)
-<a href="https://opencollective.com/ankidroid#sponsor" target="_blank">
-  <img alt="AnkiDroid Sponsors" src="https://opencollective.com/Ankidroid/sponsors.svg?width=890" />
-</a>
-
 ### [Backers](https://opencollective.com/ankidroid#backer)
 
 A big thank you to each of our backers 🙏
@@ -109,6 +98,7 @@ A big thank you to each of our backers 🙏
   <img alt="Donate to AnkiDroid" src="https://opencollective.com/Ankidroid/donate/button@2x.png?color=blue" width=200 />
 </a>
 
+Created master branch
 ### [Translators](https://crowdin.com/project/ankidroid/activity-stream)
 
 Thanks to our 1400 translators, for allowing us to be available, partially or totally, in 99 languages as of July 2022.
